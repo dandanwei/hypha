@@ -17,6 +17,8 @@ from hypha.core.auth import (
     create_scope,
     update_user_scope,
 )
+import time
+from datetime import datetime, timezone
 
 
 LOGLEVEL = os.environ.get("HYPHA_LOGLEVEL", "WARNING").upper()
@@ -294,6 +296,10 @@ class WebsocketServer:
 
             async def send_bytes(data):
                 try:
+                    # Log WebSocket message sending
+                    timestamp = datetime.now(timezone.utc).isoformat()
+                    logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [WS_SEND] client_id={client_id} data_size={len(data)}bytes")
+
                     await websocket.send_bytes(data)
                 except Exception as e:
                     logger.error("Failed to send message via websocket: %s", str(e))
@@ -318,6 +324,10 @@ class WebsocketServer:
             while not self._stop:
                 data = await websocket.receive()
                 if "bytes" in data:
+                    # Log WebSocket message reception
+                    timestamp = datetime.now(timezone.utc).isoformat()
+                    logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [WS_RECEIVE] client_id={client_id} data_size={len(data['bytes'])}bytes")
+
                     data = data["bytes"]
                     await conn.emit_message(data)
                 elif "text" in data:

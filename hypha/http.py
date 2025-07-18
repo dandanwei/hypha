@@ -34,6 +34,9 @@ from hypha.core.auth import AUTH0_DOMAIN
 from hypha.core.store import RedisStore
 from hypha.utils import GzipRoute, safe_join, is_safe_path
 
+import time
+from datetime import datetime, timezone
+
 LOGLEVEL = os.environ.get("HYPHA_LOGLEVEL", "WARNING").upper()
 logging.basicConfig(level=LOGLEVEL, stream=sys.stdout)
 logger = logging.getLogger("http")
@@ -571,18 +574,39 @@ class HTTPProxy:
 
         async def _call_service_function(func, kwargs):
             """Call a service function by keys."""
+
+            # Log start of service function call
+            start_time = time.time()
+            timestamp = datetime.now(timezone.utc).isoformat()
+            logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [SERVICE_CALL_START] func={func.__name__ if hasattr(func, '__name__') else 'unknown'}")
+
             _rpc = RPC(None, "anon")
 
+            # Log decode time
+            decode_start = time.time()
             kwargs = _rpc.decode(kwargs)
+            decode_time = time.time() - decode_start
+            logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [SERVICE_DECODE] func={func.__name__ if hasattr(func, '__name__') else 'unknown'} decode_time={decode_time*1000:.3f}ms")
+
+            # Log actual function execution
+            exec_start = time.time()
             results = func(**kwargs)
             if inspect.isawaitable(results):
                 results = await results
+            exec_time = time.time() - exec_start
+            logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [SERVICE_EXEC] func={func.__name__ if hasattr(func, '__name__') else 'unknown'} exec_time={exec_time*1000:.3f}ms")
 
             # Check if the result is a generator (regular or async)
             if inspect.isgenerator(results) or inspect.isasyncgen(results):
                 return results  # Return the generator directly without encoding
 
+            # Log encode time
+            encode_start = time.time()
             results = _rpc.encode(results)
+            encode_time = time.time() - encode_start
+            total_time = time.time() - start_time
+            logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [SERVICE_CALL_END] func={func.__name__ if hasattr(func, '__name__') else 'unknown'} encode_time={encode_time*1000:.3f}ms total_time={total_time*1000:.3f}ms")
+
             return results
 
         async def _create_streaming_response(generator, response_type):

@@ -29,10 +29,12 @@ from hypha.core.activity import ActivityTracker
 
 from prometheus_client import Counter, Gauge
 
+from datetime import datetime, timezone
+
 
 class AutoscalingConfig(BaseModel):
     """Represent autoscaling configuration for apps."""
-    
+
     enabled: bool = False
     min_instances: int = 1
     max_instances: int = 10
@@ -532,11 +534,18 @@ class RedisRPCConnection:
 
     async def emit_message(self, data: Union[dict, bytes]):
         """Send message after packing additional info."""
+
         assert isinstance(data, bytes), "Data must be bytes"
         if self._stop:
             raise ValueError(
                 f"Connection has already been closed (client: {self._workspace}/{self._client_id})"
             )
+
+        # Log start of message processing
+        start_time = time.time()
+        timestamp = datetime.now(timezone.utc).isoformat()
+        logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [EMIT_START] client_id={self._client_id} workspace={self._workspace}")
+
         unpacker = msgpack.Unpacker(io.BytesIO(data))
         message = unpacker.unpack()
         pos = unpacker.tell()
@@ -564,19 +573,28 @@ class RedisRPCConnection:
         )
 
         packed_message = msgpack.packb(message) + data[pos:]
-        # logger.info(f"Sending message to channel {target_id}:msg")
+
+        # Log before sending to Redis
+        pre_redis_time = time.time()
+        logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [PRE_REDIS] client_id={self._client_id} target={target_id} encode_time={(pre_redis_time-start_time)*1000:.3f}ms")
+
         await self._event_bus.emit(f"{target_id}:msg", packed_message)
+
+        # Log after sending to Redis
+        post_redis_time = time.time()
+        logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [POST_REDIS] client_id={self._client_id} target={target_id} redis_send_time={(post_redis_time-pre_redis_time)*1000:.3f}ms total_time={(post_redis_time-start_time)*1000:.3f}ms")
+
         RedisRPCConnection._counter.labels(workspace=self._workspace).inc()
-        
+
         # Track client requests
         RedisRPCConnection._client_request_counter.labels(
             workspace=self._workspace, client_id=self._client_id
         ).inc()
-        
+
         # Update load based on message rate (requests per minute) only for load balancing enabled clients
         if self._is_load_balancing_enabled():
             self._update_load_metric()
-        
+
         await RedisRPCConnection._tracker.reset_timer(
             self._workspace + "/" + self._client_id, "client"
         )
@@ -592,16 +610,16 @@ class RedisRPCConnection:
             current_requests = RedisRPCConnection._client_request_counter.labels(
                 workspace=self._workspace, client_id=self._client_id
             )._value._value
-            
+
             # Calculate requests per minute based on recent activity
             # We'll use a simple approach: current timestamp and request count
             current_time = time.time()
-            
+
             # Store the last update time and request count for this client
             client_key = f"{self._workspace}/{self._client_id}"
             if not hasattr(RedisRPCConnection, '_client_metrics'):
                 RedisRPCConnection._client_metrics = {}
-            
+
             if client_key not in RedisRPCConnection._client_metrics:
                 RedisRPCConnection._client_metrics[client_key] = {
                     'last_time': current_time,
@@ -611,26 +629,26 @@ class RedisRPCConnection:
             else:
                 last_time = RedisRPCConnection._client_metrics[client_key]['last_time']
                 last_requests = RedisRPCConnection._client_metrics[client_key]['last_requests']
-                
+
                 # Calculate time difference in minutes
                 time_diff = (current_time - last_time) / 60.0
-                
+
                 if time_diff > 0:
                     # Calculate requests per minute
                     request_diff = current_requests - last_requests
                     load = request_diff / time_diff
                 else:
                     load = 0.0
-                
+
                 # Update stored values
                 RedisRPCConnection._client_metrics[client_key]['last_time'] = current_time
                 RedisRPCConnection._client_metrics[client_key]['last_requests'] = current_requests
-            
+
             # Set the load gauge
             RedisRPCConnection._client_load_gauge.labels(
                 workspace=self._workspace, client_id=self._client_id
             ).set(load)
-            
+
         except Exception as e:
             logger.warning(f"Failed to update load metric: {e}")
 
@@ -648,7 +666,7 @@ class RedisRPCConnection:
             # Only return load for load balancing enabled clients
             if not client_id.endswith("__rlb"):
                 return 0.0
-            
+
             metric = cls._client_load_gauge.labels(workspace=workspace, client_id=client_id)
             return metric._value._value if hasattr(metric, '_value') else 0.0
         except Exception:
@@ -673,13 +691,13 @@ class RedisRPCConnection:
         await RedisRPCConnection._tracker.remove_entity(
             self._workspace + "/" + self._client_id, "client"
         )
-        
+
         # Clean up metrics for load balancing enabled clients only
         if self._is_load_balancing_enabled():
             client_key = f"{self._workspace}/{self._client_id}"
             if hasattr(RedisRPCConnection, '_client_metrics') and client_key in RedisRPCConnection._client_metrics:
                 del RedisRPCConnection._client_metrics[client_key]
-            
+
             RedisRPCConnection._client_load_gauge.labels(
                 workspace=self._workspace, client_id=self._client_id
             ).set(0)
@@ -793,6 +811,12 @@ class RedisEventBus:
         """Emit an event."""
         if not self._ready.done():
             self._ready.set_result(True)
+
+        # Log start of emit operation
+        start_time = time.time()
+        timestamp = datetime.now(timezone.utc).isoformat()
+        logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [EMIT_START] event={event_name}")
+
         tasks = []
 
         # Emit locally
@@ -812,10 +836,19 @@ class RedisEventBus:
             assert data and isinstance(
                 data, (str, bytes)
             ), "Data must be a string or bytes"
+
+        # Log before Redis publish
+        pre_publish_time = time.time()
+        logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [PRE_PUBLISH] event={event_name} data_type={data_type} encode_time={(pre_publish_time-start_time)*1000:.3f}ms")
+
         global_task = self._loop.create_task(
             self._redis.publish("event:" + data_type + event_name, data)
         )
         tasks.append(global_task)
+
+        # Log after Redis publish
+        post_publish_time = time.time()
+        logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [POST_PUBLISH] event={event_name} redis_publish_time={(post_publish_time-pre_publish_time)*1000:.3f}ms total_time={(post_publish_time-start_time)*1000:.3f}ms")
 
         if tasks:
             return asyncio.gather(*tasks)
@@ -1065,13 +1098,28 @@ class RedisEventBus:
         """Process a single message while respecting the semaphore."""
         async with semaphore:
             try:
+                # Log start of message processing
+                start_time = time.time()
+                timestamp = datetime.now(timezone.utc).isoformat()
                 channel = msg["channel"].decode("utf-8")
+                logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [RECEIVE_START] channel={channel}")
+
                 RedisEventBus._counter.labels(event="*", status="processed").inc()
 
                 if channel.startswith("event:b:"):
                     event_type = channel[8:]
                     data = msg["data"]
+
+                    # Log before processing
+                    pre_process_time = time.time()
+                    logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [PRE_PROCESS] event={event_type} decode_time={(pre_process_time-start_time)*1000:.3f}ms")
+
                     await self._redis_event_bus.emit(event_type, data)
+
+                    # Log after processing
+                    post_process_time = time.time()
+                    logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [POST_PROCESS] event={event_type} process_time={(post_process_time-pre_process_time)*1000:.3f}ms total_time={(post_process_time-start_time)*1000:.3f}ms")
+
                     if ":" not in event_type:
                         RedisEventBus._counter.labels(
                             event=event_type, status="processed"
@@ -1079,7 +1127,17 @@ class RedisEventBus:
                 elif channel.startswith("event:d:"):
                     event_type = channel[8:]
                     data = json.loads(msg["data"])
+
+                    # Log before processing
+                    pre_process_time = time.time()
+                    logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [PRE_PROCESS] event={event_type} decode_time={(pre_process_time-start_time)*1000:.3f}ms")
+
                     await self._redis_event_bus.emit(event_type, data)
+
+                    # Log after processing
+                    post_process_time = time.time()
+                    logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [POST_PROCESS] event={event_type} process_time={(post_process_time-pre_process_time)*1000:.3f}ms total_time={(post_process_time-start_time)*1000:.3f}ms")
+
                     if ":" not in event_type:
                         RedisEventBus._counter.labels(
                             event=event_type, status="processed"
@@ -1087,7 +1145,17 @@ class RedisEventBus:
                 elif channel.startswith("event:s:"):
                     event_type = channel[8:]
                     data = msg["data"].decode("utf-8")
+
+                    # Log before processing
+                    pre_process_time = time.time()
+                    logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [PRE_PROCESS] event={event_type} decode_time={(pre_process_time-start_time)*1000:.3f}ms")
+
                     await self._redis_event_bus.emit(event_type, data)
+
+                    # Log after processing
+                    post_process_time = time.time()
+                    logger.info(f"[HYPHA_BENCHMARK] [{timestamp}] [POST_PROCESS] event={event_type} process_time={(post_process_time-pre_process_time)*1000:.3f}ms total_time={(post_process_time-start_time)*1000:.3f}ms")
+
                     if ":" not in event_type:
                         RedisEventBus._counter.labels(
                             event=event_type, status="processed"
